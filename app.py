@@ -9,8 +9,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "scanner"))
 from regex_scanner import scan_text, PATTERNS
 
 app = Flask(__name__)
-CORS(app)
-
+CORS(app, resources={r"/*": {"origins": "*"}})
 model = joblib.load("models/classifier.pkl")
 vectorizer = joblib.load("models/vectorizer.pkl")
 

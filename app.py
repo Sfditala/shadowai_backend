@@ -21,9 +21,10 @@ LABELS_AR = {
     "safe": "آمن 🟢",
 }
 
+# ✨ رُفعت نسبة high من 0.80 → 0.85
 RISK_SCORES = {
     "critical": 0.95,
-    "high": 0.80,
+    "high": 0.85,
     "medium": 0.55,
     "safe": 0.10,
 }
@@ -31,11 +32,6 @@ RISK_SCORES = {
 
 def get_final_level(regex_level, ml_level):
     priority = {"critical": 4, "high": 3, "medium": 2, "safe": 1}
-
-    # ✨ لو Regex قال medium والـ ML قال critical → نثق بالـ Regex
-    if regex_level == "medium" and ml_level == "critical":
-        return "medium"
-
     return (
         regex_level
         if priority.get(regex_level, 0) >= priority.get(ml_level, 0)
@@ -45,17 +41,18 @@ def get_final_level(regex_level, ml_level):
 
 def get_detected_with_snippets(text):
     """
-    يفحص النص ويرجع المشاكل مع الجزء المكتشف
-    snippet = الجزء الحساس من النص
-    ✨ محدّث: يدعم كشف البطاقات الذكي (Luhn) وكشف مقدمة الدولة للهاتف
+    يفحص النص ويرجع المشاكل مع snippet لكل مشكلة.
+
+    ✨ v2:
+    - تمرير النص كسياق لـ classify_card
+    - دعم suspicious: فاشل Luhn + سياق بطاقة → high
+    - تفريق sk_live (critical) عن sk_test (medium)
     """
     from regex_scanner import is_code
 
     text_is_code = is_code(text)
     detected = []
-    has_critical = False
-    has_high = False
-    has_medium = False
+    has_critical = has_high = has_medium = False
 
     for rule in PATTERNS:
         if text_is_code and rule.get("skip_if_code", False):
@@ -65,23 +62,26 @@ def get_detected_with_snippets(text):
         if not matches:
             continue
 
-        first_match = matches[0]
-        matched_text = first_match.group()
+        matched_text = matches[0].group()
         snippet = matched_text[:37] + "..." if len(matched_text) > 40 else matched_text
-
         level = rule["level"]
         message = rule["message"]
         extra = {}
 
-        # ✨ كشف البطاقات الذكي باستخدام Luhn
+        # ✨ كشف البطاقات الذكي
         if rule.get("card_check"):
             card_digits = matched_text.replace(" ", "").replace("-", "")
-            card_info = classify_card(card_digits)
+            card_info = classify_card(card_digits, context_text=text)
             extra["card_analysis"] = card_info
 
             if card_info["is_test"]:
                 level = "medium"
                 message = f"بطاقة {card_info['card_type']} تيست 🧪 — غير حقيقية"
+            elif card_info.get("suspicious"):
+                level = "high"
+                message = (
+                    f"رقم {card_info['card_type']} مشبوه ⚠️ — فشل Luhn لكن سياق بطاقة!"
+                )
             elif not card_info["is_valid"]:
                 level = "medium"
                 message = f"رقم {card_info['card_type']} غير صالح — فشل Luhn"
@@ -113,14 +113,11 @@ def get_detected_with_snippets(text):
         elif level == "medium":
             has_medium = True
 
-    if has_critical:
-        highest_level = "critical"
-    elif has_high:
-        highest_level = "high"
-    elif has_medium:
-        highest_level = "medium"
-    else:
-        highest_level = None
+    highest_level = (
+        "critical"
+        if has_critical
+        else "high" if has_high else "medium" if has_medium else None
+    )
 
     return {
         "detected": detected,
@@ -132,73 +129,24 @@ def get_detected_with_snippets(text):
 @app.route("/scan", methods=["POST"])
 def scan():
     start_time = time.time()
-
     data = request.get_json()
     text = data.get("text", "")
 
     if not text.strip():
         return jsonify({"error": "النص فاضي"}), 400
 
-    # ================================================================
-    # ✨ Override فوري: مفاتيح التيست دائماً medium بغض النظر عن ML
-    # السبب: ML لا يستطيع التمييز بين sk_test_ و sk_live_ بدقة كافية
-    # الـ Regex أدق لهاي الحالات المحددة
-    # ================================================================
-    TEST_PATTERNS = [
-        r"sk_test_[A-Za-z0-9]{10,}",
-        r"pk_test_[A-Za-z0-9]{10,}",
-        r"rk_test_[A-Za-z0-9]{10,}",
-    ]
-    LIVE_PATTERNS = [
-        r"sk_live_",
-        r"pk_live_",
-        r"rk_live_",
-    ]
-
-    has_test_key = any(re.search(p, text) for p in TEST_PATTERNS)
-    has_live_key = any(re.search(p, text) for p in LIVE_PATTERNS)
-
-    if has_test_key and not has_live_key:
-        regex_result = get_detected_with_snippets(text)
-        scan_duration_ms = round((time.time() - start_time) * 1000)
-        return jsonify(
-            {
-                "result": {
-                    "risk_level": "medium",
-                    "risk_label_ar": LABELS_AR["medium"],
-                    "risk_score": round(RISK_SCORES["medium"], 2),
-                    "should_block": False,
-                    "message_ar": "النص آمن للإرسال",
-                    "detected": regex_result["detected"],
-                    "ml_prediction": None,
-                    "detection_method": "regex",
-                    "scan_duration_ms": scan_duration_ms,
-                    "text_length": len(text),
-                }
-            }
-        )
-
-    # ================================================================
-    # ── المرحلة 1: فحص Regex دائماً ──
-    # ================================================================
+    # المرحلة 1: Regex دائماً
     regex_result = get_detected_with_snippets(text)
     regex_level = regex_result["highest_level"]
 
-    # ================================================================
-    # ── المرحلة 2: Smart Pre-filter ──
-    # لو الـ Regex وجد critical أو high → لا نحتاج ML أصلاً
-    # الـ Regex أسرع بكثير ودقيق 100% للأنماط المعروفة
-    # ================================================================
-    ml_pred = None
-    ml_prob = None
+    # Smart Pre-filter: لو critical/high من Regex → تخطّ ML
+    ml_pred = ml_prob = None
     used_ml = False
 
     if regex_level in ["critical", "high"]:
-        # Regex كفيل — تخطّ ML
         final_level = regex_level
         final_score = RISK_SCORES[regex_level]
     else:
-        # نشغّل ML للنصوص الغامضة أو الآمنة
         used_ml = True
         X = vectorizer.transform([text])
         ml_pred = model.predict(X)[0]
@@ -214,7 +162,6 @@ def scan():
     should_block = final_level in ["critical", "high"]
     scan_duration_ms = round((time.time() - start_time) * 1000)
 
-    # ✨ detection_method: نخبر الـ UI كيف تم الكشف
     if used_ml and regex_level:
         detection_method = "regex + ml"
     elif used_ml:
@@ -243,6 +190,6 @@ def scan():
 
 
 if __name__ == "__main__":
-    print("🛡️  ShadowAI Detector API")
+    print("🛡️  ShadowAI Detector API v2")
     print("📡 Running on http://localhost:5000")
     app.run(debug=True, port=5000)
